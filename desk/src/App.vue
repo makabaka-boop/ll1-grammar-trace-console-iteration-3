@@ -1,5 +1,5 @@
 <script setup>
-import { ref, computed, reactive } from 'vue'
+import { ref, computed } from 'vue'
 
 // ---- 编辑器状态 ----
 const grammarText = ref(`E -> T R
@@ -33,6 +33,55 @@ const prodById = computed(() => {
   result.value?.productions.forEach(p => m.set(p.id, p))
   return m
 })
+
+// 冲突来源见证：与表格、产生式列表共用同一份 productions 身份（同一分析请求）。
+const routeLabel = { first: '右部 FIRST 命中', follow: '可空后经 FOLLOW 命中' }
+const kindLabel = {
+  'first-term': '右部终结符',
+  'first-derive': 'FIRST 展开',
+  'follow-entry': '可空按 FOLLOW 填列',
+  'follow-first': '后缀 FIRST 入 FOLLOW',
+  'follow-propagate': 'FOLLOW 回填',
+  'follow-anchor': '开始符 $ 锚点'
+}
+
+// witnessGroups 按竞争产生式分组（后端已按规则编号序、first 先于 follow 排好）。
+const witnessGroups = computed(() => {
+  const c = result.value?.conflict
+  if (!c || !Array.isArray(c.witnesses)) return []
+  const groups = new Map()
+  for (const w of c.witnesses) {
+    if (!groups.has(w.productionId)) {
+      groups.set(w.productionId, [])
+    }
+    groups.get(w.productionId).push(w)
+  }
+  // 组顺序与表格格内编号一致（冲突格 productionIds）
+  return (c.productionIds || [])
+    .filter(id => groups.has(id))
+    .map(id => ({ productionId: id, witnesses: groups.get(id) }))
+})
+
+const highlightedRule = ref(null)
+
+function ruleTextOf(id) {
+  const p = prodById.value.get(id)
+  if (!p) return `#${id}`
+  return `${p.head} -> ${rhsDisplay(p)}`
+}
+
+// 点击见证中的产生式编号：滚动并高亮“产生式”面板里同一次分析的对应规则。
+function locateProduction(id) {
+  if (!id || !prodById.value.has(id)) return
+  highlightedRule.value = id
+  const el = document.querySelector(`[data-rule-id="${id}"]`)
+  if (el) el.scrollIntoView({ behavior: 'smooth', block: 'center' })
+}
+
+// linkKindLabel 给出单个传播环的简述（页面在 note 之外再给类别徽标）。
+function linkKindLabel(kind) {
+  return kindLabel[kind] || kind
+}
 
 function rhsDisplay(p) {
   if (p.epsilon) return 'ε'
@@ -88,6 +137,7 @@ async function submit() {
     result.value = data
     resultSeq.value = seq
     resultEditVersion.value = editVersion.value
+    highlightedRule.value = null // 定位高亮只属于当前这次分析结果
   } catch (e) {
     if (seq !== requestSeq) return
     result.value = null
@@ -232,7 +282,12 @@ function rowTestId(step) {
         <div class="panel">
           <h2>产生式（编号即表内引用）</h2>
           <div class="rules" data-testid="rules">
-            <div v-for="p in result.productions" :key="p.id">
+            <div
+              v-for="p in result.productions"
+              :key="p.id"
+              :data-rule-id="p.id"
+              :class="['rule-row', { 'rule-flash': highlightedRule === p.id }]"
+            >
               <span class="rid">{{ p.id }}.</span>{{ p.head }} -&gt;
               <span :class="{ eps: p.epsilon }">{{ rhsDisplay(p) }}</span>
             </div>
@@ -290,6 +345,82 @@ function rowTestId(step) {
           <div class="rules" data-testid="conflict-rules">
             <div v-for="rule in result.conflict.rules" :key="rule">• {{ rule }}</div>
           </div>
+
+          <!-- 冲突来源见证：每条规则为何落入该格（first / follow），传播链可点击定位回原产生式 -->
+          <div class="witnesses" data-testid="witness-list">
+            <h3>冲突来源见证（点击编号定位规则）</h3>
+            <div
+              v-for="group in witnessGroups"
+              :key="group.productionId"
+              class="witness-group"
+              :data-testid="`witness-group-${group.productionId}`"
+            >
+              <p class="witness-head">
+                <button
+                  type="button"
+                  class="pid-chip"
+                  :data-testid="`witness-rule-chip-${group.productionId}`"
+                  @click="locateProduction(group.productionId)"
+                >{{ group.productionId }}</button>
+                <span class="witness-rule-text" :data-testid="`witness-rule-text-${group.productionId}`">
+                  {{ ruleTextOf(group.productionId) }}
+                </span>
+                <span
+                  v-if="group.witnesses.length > 1"
+                  class="dual-badge"
+                  data-testid="dual-source-badge"
+                  title="同一规则经右部 FIRST 与可空后 FOLLOW 两途命中；表格中仍只计一条规则"
+                >两途命中 · 表中只计一条</span>
+              </p>
+              <ol class="witness-routes">
+                <li
+                  v-for="(w, wi) in group.witnesses"
+                  :key="wi"
+                  :data-testid="`witness-route-${group.productionId}-${w.route}`"
+                  class="witness-route"
+                >
+                  <span class="route-badge" :class="`route-${w.route}`">
+                    {{ routeLabel[w.route] }}
+                  </span>
+                  <ol class="witness-chain">
+                    <li
+                      v-for="(link, li) in w.chain"
+                      :key="li"
+                      class="chain-link"
+                      :data-testid="`chain-link-${group.productionId}-${li}`"
+                    >
+                      <span class="chain-kind">{{ linkKindLabel(link.kind) }}</span>
+                      <button
+                        v-if="link.productionId"
+                        type="button"
+                        class="pid-chip"
+                        :data-testid="`chain-pid-${group.productionId}-${li}`"
+                        @click="locateProduction(link.productionId)"
+                      >{{ link.productionId }}</button>
+                      <span v-else class="anchor-chip" data-testid="anchor-chip">开始符</span>
+                      <span
+                        v-if="link.nullableProof && link.nullableProof.length"
+                        class="nullable-proof"
+                        :data-testid="`nullable-proof-${group.productionId}-${li}`"
+                      >
+                        可空见证：
+                        <button
+                          v-for="(nid, ni) in link.nullableProof"
+                          :key="ni"
+                          type="button"
+                          class="pid-chip proof-chip"
+                          :data-testid="`proof-pid-${group.productionId}-${li}-${ni}`"
+                          @click="locateProduction(nid)"
+                        >{{ nid }}</button>
+                      </span>
+                      <span class="chain-note">{{ link.note }}</span>
+                    </li>
+                  </ol>
+                </li>
+              </ol>
+            </div>
+          </div>
+
           <p class="hint">该文法不是 LL(1)：服务端不会为其生成任何解析回放（避免伪造推导步骤）。</p>
         </div>
 

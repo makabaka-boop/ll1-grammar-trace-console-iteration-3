@@ -4,6 +4,7 @@ package main
 //   - 文法解析与校验（1~15 个大写非终结符、至多 30 条产生式、小写终结符、空右部即 ε）
 //   - 迭代（不动点）求 nullable / FIRST / FOLLOW，FOLLOW 中绝不放入 ε
 //   - 构造 LL(1) 预测分析表，同一格落入多条不同产生式即冲突
+//   - 冲突格附冲突来源见证（见 witness.go）：每条竞争规则经 FIRST 或 FOLLOW 命中及无环传播链
 //   - 无冲突时回放 栈 / 剩余输入 / 所用规则；非法词或不被接受时返回首个失败步骤
 
 import (
@@ -21,11 +22,15 @@ type Production struct {
 }
 
 // ConflictInfo 描述按 (非终结符, 终结符) 字节序最小的冲突格及其全部竞争规则。
+// Witnesses 给出每条竞争产生式落入该格的来源见证：first（右部 FIRST 命中）或
+// follow（右部可空后经 FOLLOW 传播命中），含可追溯到原产生式的无环传播链；
+// 同一规则两途皆中时保留两份见证，但 ProductionIDs 中仍只计一条规则。
 type ConflictInfo struct {
-	Nonterminal   string   `json:"nonterminal"`
-	Terminal      string   `json:"terminal"` // "$" 表示输入结束符
-	ProductionIDs []int    `json:"productionIds"`
-	Rules         []string `json:"rules"`
+	Nonterminal   string    `json:"nonterminal"`
+	Terminal      string    `json:"terminal"` // "$" 表示输入结束符
+	ProductionIDs []int     `json:"productionIds"`
+	Rules         []string  `json:"rules"`
+	Witnesses     []Witness `json:"witnesses"`
 }
 
 // Step 是一次分析动作发生前的栈与剩余输入快照。
@@ -354,9 +359,10 @@ func (g *grammar) buildTable() {
 }
 
 // findConflict 按非终结符字节序、再按终结符字节序（"$" 最先）扫描，
-// 返回第一个含多条不同产生式的格及全部竞争规则。
+// 返回第一个含多条不同产生式的格及全部竞争规则，并为每条规则附来源见证。
 func (g *grammar) findConflict() *ConflictInfo {
 	columns := append(append([]string{}, sortedKeys(g.terminals, terminalLess)...), "$")
+	wb := newWitnessBuilder(g)
 	for _, nt := range sortedKeys(g.nonterminals, nil) {
 		for _, col := range columns {
 			cell := g.table[nt][col]
@@ -372,6 +378,7 @@ func (g *grammar) findConflict() *ConflictInfo {
 					Terminal:      col,
 					ProductionIDs: ids,
 					Rules:         rules,
+					Witnesses:     wb.witnesses(nt, col, ids),
 				}
 			}
 		}

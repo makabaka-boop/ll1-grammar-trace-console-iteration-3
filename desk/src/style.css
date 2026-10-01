@@ -92,6 +92,46 @@ td.cell-used { background: #e0f2fe; }
 .rules { font-family: Consolas, monospace; font-size: 13px; line-height: 1.7; }
 .rules .rid { color: #829ab1; margin-right: 8px; }
 .rules .eps { color: #9d174d; }
+.rule-row { border-radius: 4px; padding: 0 4px; margin: 0 -4px; transition: background 0.3s; }
+.rule-flash { background: #fef3c7 !important; animation: rule-pulse 1.2s ease-in-out 2; }
+@keyframes rule-pulse {
+  0%, 100% { background: #fef3c7; }
+  50% { background: #fde68a; }
+}
+
+/* 冲突来源见证 */
+.witnesses { margin-top: 12px; border-top: 1px dashed #bcccdc; padding-top: 8px; }
+.witnesses h3 { margin: 4px 0 8px; font-size: 13px; color: #243b53; }
+.witness-group { margin-bottom: 12px; padding: 8px 10px; background: #f8fafc; border: 1px solid #d9e2ec; border-radius: 6px; }
+.witness-head { margin: 0 0 6px; display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.witness-rule-text { font-family: Consolas, monospace; font-size: 13px; font-weight: 600; color: #243b53; }
+.dual-badge { font-size: 11px; background: #fef3c7; color: #92400e; border-radius: 10px; padding: 1px 8px; }
+ol.witness-routes { list-style: none; padding-left: 0; margin: 0; }
+.witness-route { margin-bottom: 6px; }
+.route-badge { display: inline-block; font-size: 12px; font-weight: 600; border-radius: 10px; padding: 1px 10px; margin-bottom: 4px; }
+.route-first { background: #e0f2fe; color: #075985; }
+.route-follow { background: #ede9fe; color: #5b21b6; }
+ol.witness-chain { list-style: none; margin: 0; padding-left: 18px; border-left: 2px solid #cbd5e1; }
+.chain-link { position: relative; padding: 3px 0 3px 10px; font-size: 12.5px; line-height: 1.5; }
+.chain-link::before { content: '→'; position: absolute; left: -14px; color: #94a3b8; }
+.chain-kind { display: inline-block; font-size: 11px; color: #475569; background: #e2e8f0; border-radius: 8px; padding: 0 7px; margin-right: 6px; }
+.chain-note { color: #334155; }
+.pid-chip {
+  font-family: Consolas, monospace; font-size: 12px; font-weight: 700;
+  background: #2563eb; color: #fff; border: 0; border-radius: 10px;
+  min-width: 20px; height: 20px; padding: 0 6px; margin: 0 2px;
+  cursor: pointer; vertical-align: baseline;
+}
+.pid-chip:hover { background: #1d4ed8; }
+.proof-chip { background: #7c3aed; }
+.proof-chip:hover { background: #6d28d9; }
+.anchor-chip {
+  font-size: 11px; background: #d1fae5; color: #065f46;
+  border-radius: 10px; padding: 1px 8px; margin: 0 2px;
+}
+.nullable-proof { color: #6d28d9; margin: 0 6px; }
+.nullable-proof::before { content: '（'; }
+.nullable-proof::after { content: '）'; }
 
 ol.trace { font-family: Consolas, monospace; font-size: 13px; padding-left: 0; list-style: none; }
 ol.trace li {
