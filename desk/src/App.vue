@@ -21,6 +21,9 @@ const resultEditVersion = ref(0)
 
 const stale = computed(() => result.value !== null && resultEditVersion.value !== editVersion.value)
 
+// 点击见证链环后定位到的产生式编号（0 表示无）
+const highlightedRule = ref(0)
+
 const tokens = computed(() => inputText.value.trim().split(/\s+/).filter(Boolean))
 
 const columns = computed(() => {
@@ -58,6 +61,19 @@ function cellRuleText(ids) {
   }).join('\n')
 }
 
+// 见证链环与表格、产生式列表共用同一产生式编号
+function ruleText(id) {
+  const p = prodById.value.get(id)
+  return p ? `${p.head} -> ${rhsDisplay(p)}` : `#${id}`
+}
+
+// 点击见证中的产生式编号：定位并高亮产生式列表中的对应规则
+function locateRule(id) {
+  highlightedRule.value = id
+  document.querySelector(`[data-testid="rule-${id}"]`)
+    ?.scrollIntoView({ behavior: 'smooth', block: 'nearest' })
+}
+
 function touch() {
   editVersion.value++
 }
@@ -88,6 +104,7 @@ async function submit() {
     result.value = data
     resultSeq.value = seq
     resultEditVersion.value = editVersion.value
+    highlightedRule.value = 0
   } catch (e) {
     if (seq !== requestSeq) return
     result.value = null
@@ -187,9 +204,13 @@ function rowTestId(step) {
           />
           错误恢复回放模式：首错后继续分析，逐步标注每处恢复（默认关闭，首错即停）
         </label>
-        <button data-testid="analyze-btn" :disabled="loading" @click="submit">
+        <button data-testid="analyze-btn" @click="submit">
           {{ loading ? '计算中…' : '计算并分析' }}
         </button>
+        <p class="hint">
+          计算期间可继续修改并重新提交：以请求版本号隔离，页面只展示最新一次请求的推导，
+          迟到的旧响应一律丢弃。
+        </p>
         <button class="secondary" @click="loadSample('ll1')">载入 LL(1) 示例</button>
         <button class="secondary" @click="loadSample('conflict')">载入冲突示例</button>
         <p class="hint">
@@ -232,7 +253,12 @@ function rowTestId(step) {
         <div class="panel">
           <h2>产生式（编号即表内引用）</h2>
           <div class="rules" data-testid="rules">
-            <div v-for="p in result.productions" :key="p.id">
+            <div
+              v-for="p in result.productions"
+              :key="p.id"
+              :data-testid="`rule-${p.id}`"
+              :class="{ 'rule-highlight': highlightedRule === p.id }"
+            >
               <span class="rid">{{ p.id }}.</span>{{ p.head }} -&gt;
               <span :class="{ eps: p.epsilon }">{{ rhsDisplay(p) }}</span>
             </div>
@@ -289,6 +315,46 @@ function rowTestId(step) {
           </p>
           <div class="rules" data-testid="conflict-rules">
             <div v-for="rule in result.conflict.rules" :key="rule">• {{ rule }}</div>
+          </div>
+
+          <!-- 冲突来源见证：每条竞争规则说明 FIRST / FOLLOW 来源及传播链 -->
+          <h3>来源见证（点击编号定位规则）</h3>
+          <div class="witnesses" data-testid="conflict-witnesses">
+            <div
+              v-for="src in result.conflict.sources || []"
+              :key="src.productionId"
+              class="witness-rule"
+              :data-testid="`witness-${src.productionId}`"
+            >
+              <div class="witness-head">
+                规则
+                <button class="rule-link" @click="locateRule(src.productionId)">
+                  #{{ src.productionId }} {{ ruleText(src.productionId) }}
+                </button>
+                落入该格：
+              </div>
+              <div
+                v-for="(w, wi) in src.sources"
+                :key="wi"
+                class="witness"
+                :data-testid="`witness-${src.productionId}-${w.kind}`"
+              >
+                <span class="badge" :class="w.kind">
+                  {{ w.kind === 'first' ? 'FIRST 命中' : 'FOLLOW 传播命中' }}
+                </span>
+                <ol class="chain">
+                  <li v-for="(link, li) in w.chain" :key="li">
+                    <button
+                      v-if="link.productionId > 0"
+                      class="rule-link"
+                      @click="locateRule(link.productionId)"
+                    >#{{ link.productionId }}</button>
+                    <span v-else class="chain-def">定义</span>
+                    {{ link.note }}
+                  </li>
+                </ol>
+              </div>
+            </div>
           </div>
           <p class="hint">该文法不是 LL(1)：服务端不会为其生成任何解析回放（避免伪造推导步骤）。</p>
         </div>

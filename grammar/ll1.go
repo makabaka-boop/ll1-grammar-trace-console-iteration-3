@@ -4,6 +4,8 @@ package main
 //   - 文法解析与校验（1~15 个大写非终结符、至多 30 条产生式、小写终结符、空右部即 ε）
 //   - 迭代（不动点）求 nullable / FIRST / FOLLOW，FOLLOW 中绝不放入 ε
 //   - 构造 LL(1) 预测分析表，同一格落入多条不同产生式即冲突
+//   - 冲突时为每条竞争产生式给出来源见证：右部 FIRST 命中，或右部可空后经
+//     FOLLOW 传播命中，附可追溯到原产生式的传播链（不成环、最短优先）
 //   - 无冲突时回放 栈 / 剩余输入 / 所用规则；非法词或不被接受时返回首个失败步骤
 
 import (
@@ -22,10 +24,32 @@ type Production struct {
 
 // ConflictInfo 描述按 (非终结符, 终结符) 字节序最小的冲突格及其全部竞争规则。
 type ConflictInfo struct {
-	Nonterminal   string   `json:"nonterminal"`
-	Terminal      string   `json:"terminal"` // "$" 表示输入结束符
-	ProductionIDs []int    `json:"productionIds"`
-	Rules         []string `json:"rules"`
+	Nonterminal   string           `json:"nonterminal"`
+	Terminal      string           `json:"terminal"` // "$" 表示输入结束符
+	ProductionIDs []int            `json:"productionIds"`
+	Rules         []string         `json:"rules"`
+	Sources       []ConflictSource `json:"sources"` // 每条竞争产生式的来源见证（FIRST / FOLLOW 可并存）
+}
+
+// ChainLink 是冲突来源传播链的一环：引用一条原产生式并说明该环的推导事实。
+// ProductionID 为 0 表示"开始符定义"环节（$ ∈ FOLLOW(start)，无产生式可引）。
+type ChainLink struct {
+	ProductionID int    `json:"productionId"`
+	Note         string `json:"note"`
+}
+
+// SourceWitness 是冲突格中一条竞争产生式的一种来源途径：
+// 右部 FIRST 命中（first），或右部可空后经 FOLLOW 传播命中（follow）。
+type SourceWitness struct {
+	Kind  string      `json:"kind"` // "first" | "follow"
+	Chain []ChainLink `json:"chain"`
+}
+
+// ConflictSource 是一条竞争产生式的全部来源：FIRST 与 FOLLOW 途径可并存
+// （保留两份），但同一规则在表格与冲突计数中仍只算一条。
+type ConflictSource struct {
+	ProductionID int             `json:"productionId"`
+	Sources      []SourceWitness `json:"sources"`
 }
 
 // Step 是一次分析动作发生前的栈与剩余输入快照。
@@ -354,7 +378,7 @@ func (g *grammar) buildTable() {
 }
 
 // findConflict 按非终结符字节序、再按终结符字节序（"$" 最先）扫描，
-// 返回第一个含多条不同产生式的格及全部竞争规则。
+// 返回第一个含多条不同产生式的格及全部竞争规则（附来源见证）。
 func (g *grammar) findConflict() *ConflictInfo {
 	columns := append(append([]string{}, sortedKeys(g.terminals, terminalLess)...), "$")
 	for _, nt := range sortedKeys(g.nonterminals, nil) {
@@ -372,11 +396,258 @@ func (g *grammar) findConflict() *ConflictInfo {
 					Terminal:      col,
 					ProductionIDs: ids,
 					Rules:         rules,
+					Sources:       g.conflictSources(nt, col, ids),
 				}
 			}
 		}
 	}
 	return nil
+}
+
+// ---------- 冲突来源见证 ----------
+//
+// 对冲突格 M[N, t] 中的每条竞争产生式 A -> β，说明它落入该格的来源：
+//   - first：t ∈ FIRST(β)；
+//   - follow：β 可空且 t ∈ FOLLOW(A)。
+//
+// 每种来源给出可追溯到原产生式的传播链（Chain 每环引用一条产生式）。
+// 链的选取：先取引用产生式最少的路径，再按产生式原始顺序（ID）裁决；
+// 以反向 Dijkstra 求解，每个 FIRST / FOLLOW 事实节点只确定一次，
+// 因此递归文法（含 FOLLOW 传播环）中的链不会循环。
+// 同一规则经两种途径命中时两份来源都保留，但表格与冲突计数中仍只算一条。
+
+// chainLess 裁决两条链：先比引用产生式数，再按产生式 ID 序列（原始顺序）。
+func chainLess(a, b []ChainLink) bool {
+	if len(a) != len(b) {
+		return len(a) < len(b)
+	}
+	for i := range a {
+		if a[i].ProductionID != b[i].ProductionID {
+			return a[i].ProductionID < b[i].ProductionID
+		}
+	}
+	return false
+}
+
+// chainCand 是 Dijkstra 队列中的候选：非终结符 nt 的一条待确定链。
+type chainCand struct {
+	nt    string
+	chain []ChainLink
+}
+
+// chainRef 是一条反向传播边：nt 的链确定后，前面拼接 link 即得 from 的候选链。
+type chainRef struct {
+	from string
+	link ChainLink
+}
+
+// bestChains 反向 Dijkstra：seeds 为直接命中 / 定义的初始候选，refs 为传播边。
+// 每个节点只确定一次（即最优），链上被解释的事实节点不重复，天然无环。
+func bestChains(seeds []chainCand, refs map[string][]chainRef) map[string][]ChainLink {
+	dist := map[string][]ChainLink{}
+	queue := append([]chainCand{}, seeds...)
+	for len(queue) > 0 {
+		best := 0
+		for i := 1; i < len(queue); i++ {
+			if chainLess(queue[i].chain, queue[best].chain) {
+				best = i
+			}
+		}
+		c := queue[best]
+		queue = append(queue[:best], queue[best+1:]...)
+		if _, ok := dist[c.nt]; ok {
+			continue
+		}
+		dist[c.nt] = c.chain
+		for _, r := range refs[c.nt] {
+			if _, ok := dist[r.from]; ok {
+				continue
+			}
+			queue = append(queue, chainCand{nt: r.from, chain: append([]ChainLink{r.link}, c.chain...)})
+		}
+	}
+	return dist
+}
+
+// firstChains 对固定终结符 t，求每个非终结符 X（t ∈ FIRST(X)）解释该事实的最优链：
+// 每环是 X 的一条产生式，最后一环的右部直接出现终结符 t。
+func (g *grammar) firstChains(t string) map[string][]ChainLink {
+	var seeds []chainCand
+	refs := map[string][]chainRef{}
+	for _, nt := range sortedKeys(g.nonterminals, nil) {
+		for _, pid := range g.byHead[nt] {
+			q := g.prods[pid-1]
+			for k := 0; k < len(q.RHS); k++ {
+				s := string(q.RHS[k])
+				if g.terminals[s] {
+					if s == t {
+						seeds = append(seeds, chainCand{nt, []ChainLink{{ProductionID: q.ID, Note: firstDirectNote(q, k, t)}}})
+					}
+					break // 终结符不可空，右部扫描到此为止
+				}
+				if g.first[s][t] {
+					refs[s] = append(refs[s], chainRef{nt, ChainLink{ProductionID: q.ID, Note: firstViaNote(q, k, s, t)}})
+				}
+				if !g.nullable[s] {
+					break
+				}
+			}
+		}
+	}
+	return bestChains(seeds, refs)
+}
+
+// followChains 对固定终结符或 $ 的 t，求每个非终结符 X（t ∈ FOLLOW(X)）的最优传播链：
+// 每环引用一条"X 出现于其右部"的原产生式；链尾或直接命中后缀 FIRST
+// （接 firstChains 子链），或落到开始符定义（仅 t 为 $ 时）。
+func (g *grammar) followChains(t string, firsts map[string][]ChainLink) map[string][]ChainLink {
+	var seeds []chainCand
+	refs := map[string][]chainRef{}
+	if t == "$" {
+		seeds = append(seeds, chainCand{g.start, []ChainLink{{
+			ProductionID: 0,
+			Note:         fmt.Sprintf("%s 是开始符，$ ∈ FOLLOW(%s)（定义）", g.start, g.start),
+		}}})
+	}
+	for _, p := range g.prods {
+		for i := 0; i < len(p.RHS); i++ {
+			x := string(p.RHS[i])
+			if !g.nonterminals[x] {
+				continue
+			}
+			rest := p.RHS[i+1:]
+			terms, tailNullable := g.firstSeq(rest)
+			if terms[t] {
+				link := ChainLink{ProductionID: p.ID, Note: followFirstNote(p, i, t)}
+				chain := append([]ChainLink{link}, g.firstSeqChain(rest, t, firsts)...)
+				seeds = append(seeds, chainCand{x, chain})
+			}
+			if tailNullable && g.follow[p.Head][t] {
+				refs[p.Head] = append(refs[p.Head], chainRef{x, ChainLink{ProductionID: p.ID, Note: followTailNote(p, i, t)}})
+			}
+		}
+	}
+	return bestChains(seeds, refs)
+}
+
+// firstSeqChain 解释 t ∈ FIRST(rest)：rest 第 j 个符号即 t 时无需更多产生式（空链），
+// 经非终结符 Z 时接 firsts[Z]；多个命中位置取最优。
+func (g *grammar) firstSeqChain(rest string, t string, firsts map[string][]ChainLink) []ChainLink {
+	var best []ChainLink
+	for j := 0; j < len(rest); j++ {
+		s := string(rest[j])
+		if g.terminals[s] {
+			if s == t {
+				return nil // 直接命中：由所在产生式环说明，子链为空
+			}
+			break
+		}
+		if g.first[s][t] {
+			if sub := firsts[s]; sub != nil && (best == nil || chainLess(sub, best)) {
+				best = sub
+			}
+		}
+		if !g.nullable[s] {
+			break
+		}
+	}
+	return best
+}
+
+// firstViaChain 以产生式 q 为第一环，解释 t ∈ FIRST(q.RHS) 的最优链。
+func (g *grammar) firstViaChain(q Production, t string, firsts map[string][]ChainLink) []ChainLink {
+	var best []ChainLink
+	for k := 0; k < len(q.RHS); k++ {
+		s := string(q.RHS[k])
+		if g.terminals[s] {
+			if s == t {
+				// 直接命中只有一环，严格短于任何经非终结符的链
+				best = []ChainLink{{ProductionID: q.ID, Note: firstDirectNote(q, k, t)}}
+			}
+			break
+		}
+		if g.first[s][t] {
+			if sub := firsts[s]; sub != nil {
+				cand := append([]ChainLink{{ProductionID: q.ID, Note: firstViaNote(q, k, s, t)}}, sub...)
+				if best == nil || chainLess(cand, best) {
+					best = cand
+				}
+			}
+		}
+		if !g.nullable[s] {
+			break
+		}
+	}
+	return best
+}
+
+// conflictSources 为冲突格 M[nt, t] 的每条竞争产生式生成来源见证。
+// 每条产生式入格必有原因（FIRST 命中或可空后经 FOLLOW），
+// 因此 sources 必然完整，绝不出现只有半份来源的冲突结果。
+func (g *grammar) conflictSources(nt, t string, ids []int) []ConflictSource {
+	firsts := g.firstChains(t)
+	follows := g.followChains(t, firsts)
+	out := make([]ConflictSource, 0, len(ids))
+	for _, pid := range ids {
+		p := g.prods[pid-1]
+		cs := ConflictSource{ProductionID: pid}
+		terms, nullable := g.firstSeq(p.RHS)
+		if terms[t] {
+			cs.Sources = append(cs.Sources, SourceWitness{Kind: "first", Chain: g.firstViaChain(p, t, firsts)})
+		}
+		if nullable && g.follow[p.Head][t] {
+			link := ChainLink{ProductionID: p.ID, Note: followHeadNote(p, t)}
+			cs.Sources = append(cs.Sources, SourceWitness{Kind: "follow", Chain: append([]ChainLink{link}, follows[p.Head]...)})
+		}
+		out = append(out, cs)
+	}
+	return out
+}
+
+// nullablePrefixNote 说明右部前 k 个符号均可空（k 为 0 时无附加说明）。
+func nullablePrefixNote(rhs string, k int) string {
+	if k == 0 {
+		return ""
+	}
+	return fmt.Sprintf("（前缀 %s 均可空）", rhsDisplay(rhs[:k]))
+}
+
+// firstDirectNote：q 右部第 k 个符号（0 起）即终结符 t。
+func firstDirectNote(q Production, k int, t string) string {
+	return fmt.Sprintf("%s ∈ FIRST(%s)：%s -> %s 右部第 %d 个符号即终结符 %s%s",
+		t, q.Head, q.Head, rhsDisplay(q.RHS), k+1, t, nullablePrefixNote(q.RHS, k))
+}
+
+// firstViaNote：q 右部第 k 个符号是非终结符 z，t 经 FIRST(z) 而来。
+func firstViaNote(q Production, k int, z, t string) string {
+	return fmt.Sprintf("%s ∈ FIRST(%s)：%s -> %s 右部第 %d 个符号 %s 的 FIRST 含 %s%s",
+		t, q.Head, q.Head, rhsDisplay(q.RHS), k+1, z, t, nullablePrefixNote(q.RHS, k))
+}
+
+// followHeadNote：冲突产生式 p 的右部可空，t ∈ FOLLOW(p.Head)。
+func followHeadNote(p Production, t string) string {
+	if p.RHS == "" {
+		return fmt.Sprintf("右部为 ε，%s ∈ FOLLOW(%s)", t, p.Head)
+	}
+	return fmt.Sprintf("右部 %s 可空，%s ∈ FOLLOW(%s)", rhsDisplay(p.RHS), t, p.Head)
+}
+
+// followFirstNote：p 右部第 i 个符号 x 之后跟 rest，t ∈ FIRST(rest)。
+func followFirstNote(p Production, i int, t string) string {
+	x := string(p.RHS[i])
+	return fmt.Sprintf("%s ∈ FOLLOW(%s)：%s -> %s 中 %s 之后跟 %s，其 FIRST 含 %s",
+		t, x, p.Head, rhsDisplay(p.RHS), x, rhsDisplay(p.RHS[i+1:]), t)
+}
+
+// followTailNote：p 右部第 i 个符号 x 的后缀可空，t 经 FOLLOW(p.Head) 传入。
+func followTailNote(p Production, i int, t string) string {
+	x := string(p.RHS[i])
+	tail := "位于尾部"
+	if rest := p.RHS[i+1:]; rest != "" {
+		tail = fmt.Sprintf("的后缀 %s 可空", rhsDisplay(rest))
+	}
+	return fmt.Sprintf("%s ∈ FOLLOW(%s)：%s -> %s 中 %s %s，由 FOLLOW(%s) 传入",
+		t, x, p.Head, rhsDisplay(p.RHS), x, tail, p.Head)
 }
 
 func rhsDisplay(rhs string) string {

@@ -126,3 +126,34 @@ label.field.checkbox input { margin: 0; }
   background: #fff7ed; border: 1px dashed #fb923c; color: #9a3412;
   border-radius: 6px; padding: 6px 10px; font-size: 12px; margin-bottom: 10px;
 }
+
+/* 冲突来源见证 */
+.panel h3 { margin: 14px 0 8px; font-size: 13px; color: #243b53; }
+.witness-rule { margin-bottom: 10px; }
+.witness-head { font-size: 13px; margin-bottom: 4px; }
+.witness { margin: 4px 0 8px 8px; }
+.badge.first { background: #e0f2fe; color: #075985; }
+.badge.follow { background: #fef3c7; color: #92400e; }
+ol.chain {
+  list-style: none;
+  margin: 4px 0 0;
+  padding-left: 14px;
+  border-left: 2px solid #d9e2ec;
+  font-family: Consolas, monospace;
+  font-size: 12px;
+  color: #334e68;
+}
+ol.chain li { padding: 2px 0; }
+.chain-def { color: #829ab1; margin-right: 4px; }
+.rule-link {
+  background: none;
+  border: 0;
+  color: #2563eb;
+  cursor: pointer;
+  font: inherit;
+  padding: 0 2px;
+  text-decoration: underline;
+}
+.rule-link:hover { color: #1d4ed8; }
+.rules > div { padding: 1px 4px; border-radius: 4px; }
+.rule-highlight { background: #fef3c7; outline: 1px solid #f59e0b; }

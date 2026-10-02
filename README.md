@@ -21,6 +21,11 @@
    同一条规则重复落入同一格只算一次；同一格出现**不同**产生式即冲突。
 4. 有冲突时：返回按（非终结符字节序，终结符字节序，`$` 最先）最小的冲突格
    及其全部竞争规则，**不生成任何解析回放**（恢复模式同样不恢复）。
+   每条竞争规则附**来源见证**（`conflict.sources`）：标明该规则由右部 FIRST 命中、
+   还是右部可空后经 FOLLOW 传播命中，并给出引用原产生式编号的传播链
+   （`$ ∈ FOLLOW(开始符)` 以编号 0 的"定义"环节收尾）。同一规则两种途径并存时
+   保留两份来源（表格中仍只计一条）；链取引用产生式最少者，并列再按产生式
+   原始顺序裁决；以反向 Dijkstra 求解，递归文法（含 FOLLOW 传播环）中不成环。
 5. 无冲突时才运行分析器，逐步回放 栈 / 剩余输入 / 所用规则；非法词或查表为空
    都在**首个失败步骤**停止并保留现场。
 6. **错误恢复回放模式**（请求显式带 `recover: true` 才开启，普通模式语义不变）：
@@ -39,12 +44,16 @@
 
 ```
 grammar/          Go 服务（核心算法 + net/http，POST /api/analyze，GET /healthz）
-  ll1.go          解析、不动点 FIRST/FOLLOW、LL(1) 表、冲突定位、栈回放与错误恢复
+  ll1.go          解析、不动点 FIRST/FOLLOW、LL(1) 表、冲突定位与来源见证、栈回放与错误恢复
   ll1_test.go     间接 ε 传播 / FOLLOW 冲突 / 递归文法 / 非法词 / 去重 / 上限
                   + 恢复模式（连续错误 / FOLLOW 同步 / 输入耗尽 / 零长度产生式 / 旧模式兼容）
+                  + 冲突来源见证（间接可空 / FIRST·FOLLOW 双重来源 / 循环传播 / 并列路径 /
+                    开始符定义 / 非法文法整次拒绝 / HTTP 一致）
 desk/             Vue 3 + Vite 前端
-  src/App.vue     文法与词序列编辑、恢复模式开关、请求版本隔离、表与回放展示
-  e2e/            Playwright 端到端流程（编辑 → 失败栈 → 冲突 → 错误恢复回放）
+  src/App.vue     文法与词序列编辑、恢复模式开关、请求版本隔离、表与回放展示、
+                  冲突来源见证（点击链环定位产生式）
+  e2e/            Playwright 端到端流程（编辑 → 失败栈 → 冲突 → 错误恢复回放 →
+                  冲突见证与请求一致性）
 docker-compose.yml  grammar（内部 :8080）+ desk（宿主机 :8081，nginx 反代 /api）
 ```
 
@@ -88,6 +97,9 @@ curl -s -X POST http://localhost:8080/api/analyze \
 
 返回 `status` 为 `conflict`（含最小冲突格 `conflict`，无 `trace`）或
 `parsed`（含 `accepted` 与逐步 `trace`；失败时 `error` 指向首个失败步骤）。
+`conflict.sources` 是每条竞争产生式的来源见证：`kind` 为 `first` / `follow`，
+`chain` 每环给出 `productionId`（0 表示开始符定义）与该环说明 `note`；
+前端表格、见证与产生式列表均以此编号引用同一规则。
 请求带 `"recover": true` 时启用错误恢复回放：恢复步骤在 `trace` 内带
 `recovery`（`kind` / `tokenIndex` / `stackTop` / `afterStack` / `afterInput`），
 响应另含 `recoverMode` / `hadError` / `recoveryCount`。

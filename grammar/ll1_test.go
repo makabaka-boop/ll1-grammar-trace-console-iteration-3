@@ -580,3 +580,349 @@ func TestRecoverHTTPSameEventSequence(t *testing.T) {
 			oldRes.RecoverMode, oldRes.HadError, oldRes.Error)
 	}
 }
+
+// ---------- 冲突来源见证 ----------
+
+// witnessOf 取出冲突中某产生式的某类来源；不存在则失败。
+func witnessOf(t *testing.T, res *AnalyzeResult, pid int, kind string) SourceWitness {
+	t.Helper()
+	if res.Conflict == nil {
+		t.Fatal("期望冲突，但没有冲突信息")
+	}
+	for _, cs := range res.Conflict.Sources {
+		if cs.ProductionID != pid {
+			continue
+		}
+		for _, w := range cs.Sources {
+			if w.Kind == kind {
+				return w
+			}
+		}
+	}
+	t.Fatalf("产生式 %d 缺少 %s 来源：%+v", pid, kind, res.Conflict.Sources)
+	return SourceWitness{}
+}
+
+// hasWitness 报告某产生式是否有某类来源。
+func hasWitness(res *AnalyzeResult, pid int, kind string) bool {
+	for _, cs := range res.Conflict.Sources {
+		if cs.ProductionID != pid {
+			continue
+		}
+		for _, w := range cs.Sources {
+			if w.Kind == kind {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// chainIDs 提取链上各环节引用的产生式编号。
+func chainIDs(w SourceWitness) []int {
+	ids := make([]int, 0, len(w.Chain))
+	for _, l := range w.Chain {
+		ids = append(ids, l.ProductionID)
+	}
+	return ids
+}
+
+// assertSourcesComplete 校验冲突来源的完整性：每条竞争产生式都有来源、链非空，
+// 且链环引用的产生式编号都真实存在（0 表示开始符定义）——绝不出现半份来源。
+func assertSourcesComplete(t *testing.T, res *AnalyzeResult) {
+	t.Helper()
+	if res.Conflict == nil {
+		return
+	}
+	if len(res.Conflict.Sources) != len(res.Conflict.ProductionIDs) {
+		t.Fatalf("来源条数 %d 与竞争规则数 %d 不一致", len(res.Conflict.Sources), len(res.Conflict.ProductionIDs))
+	}
+	valid := map[int]bool{}
+	for _, p := range res.Productions {
+		valid[p.ID] = true
+	}
+	seen := map[int]bool{}
+	for _, cs := range res.Conflict.Sources {
+		if seen[cs.ProductionID] {
+			t.Errorf("产生式 %d 的来源重复出现", cs.ProductionID)
+		}
+		seen[cs.ProductionID] = true
+		if !valid[cs.ProductionID] {
+			t.Errorf("来源指向不存在的产生式 %d", cs.ProductionID)
+		}
+		if len(cs.Sources) == 0 {
+			t.Errorf("产生式 %d 没有任何来源（半份来源）", cs.ProductionID)
+		}
+		for _, w := range cs.Sources {
+			if len(w.Chain) == 0 {
+				t.Errorf("产生式 %d 的 %s 来源链为空", cs.ProductionID, w.Kind)
+			}
+			for _, l := range w.Chain {
+				if l.ProductionID != 0 && !valid[l.ProductionID] {
+					t.Errorf("链环引用不存在的产生式 %d", l.ProductionID)
+				}
+				if l.Note == "" {
+					t.Errorf("链环缺少说明：%+v", l)
+				}
+			}
+		}
+	}
+}
+
+// 17) 间接可空：A -> B C 的右部经 B -> D -> ε 与 C -> ε 多级传播才可空，
+//     其 FOLLOW 见证必须说明右部可空，并给出经 S -> A t 的传播链。
+func TestWitnessIndirectNullable(t *testing.T) {
+	text := strings.Join([]string{
+		"S -> A t",
+		"A -> B C",
+		"A -> t",
+		"B -> D",
+		"D ->",
+		"C ->",
+	}, "\n")
+	res, err := analyze(text, "S", []string{"t"})
+	if err != nil {
+		t.Fatalf("analyze: %v", err)
+	}
+	if res.Status != "conflict" || res.Conflict == nil {
+		t.Fatalf("status = %q，期望 conflict", res.Status)
+	}
+	if res.Conflict.Nonterminal != "A" || res.Conflict.Terminal != "t" {
+		t.Fatalf("冲突格 = (%s, %s)，期望 (A, t)", res.Conflict.Nonterminal, res.Conflict.Terminal)
+	}
+	if !reflect.DeepEqual(res.Conflict.ProductionIDs, []int{2, 3}) {
+		t.Fatalf("竞争规则 = %v，期望 [2 3]", res.Conflict.ProductionIDs)
+	}
+	if !reflect.DeepEqual(res.Table["A"]["t"], []int{2, 3}) {
+		t.Fatalf("M[A, t] = %v，期望 [2 3]（每条规则只计一次）", res.Table["A"]["t"])
+	}
+
+	// A -> B C：右部间接可空，经 FOLLOW 命中；链 = 自身 + S -> A t
+	w := witnessOf(t, res, 2, "follow")
+	if got := chainIDs(w); !reflect.DeepEqual(got, []int{2, 1}) {
+		t.Fatalf("A -> B C 的 FOLLOW 链 = %v，期望 [2 1]", got)
+	}
+	if !strings.Contains(w.Chain[0].Note, "可空") {
+		t.Errorf("首环应说明右部可空：%q", w.Chain[0].Note)
+	}
+	if !strings.Contains(w.Chain[1].Note, "S -> A t") {
+		t.Errorf("次环应指向 S -> A t：%q", w.Chain[1].Note)
+	}
+	if hasWitness(res, 2, "first") {
+		t.Error("FIRST(B C) 为空，A -> B C 不应有 first 来源")
+	}
+
+	// A -> t：FIRST 直接命中，链只有自身一环
+	w3 := witnessOf(t, res, 3, "first")
+	if got := chainIDs(w3); !reflect.DeepEqual(got, []int{3}) {
+		t.Fatalf("A -> t 的 FIRST 链 = %v，期望 [3]", got)
+	}
+	if hasWitness(res, 3, "follow") {
+		t.Error("A -> t 不可空，不应有 follow 来源")
+	}
+	assertSourcesComplete(t, res)
+}
+
+// 18) FIRST/FOLLOW 双重来源：A -> B 中 B 既可空又含 t，
+//     同一规则经两种途径命中 M[A, t]，两份来源都保留，表格仍只计一条。
+func TestWitnessDualSource(t *testing.T) {
+	text := strings.Join([]string{
+		"S -> A t",
+		"A -> B",
+		"A -> t",
+		"B -> t",
+		"B ->",
+	}, "\n")
+	res, err := analyze(text, "S", []string{"t"})
+	if err != nil {
+		t.Fatalf("analyze: %v", err)
+	}
+	if res.Conflict == nil || res.Conflict.Nonterminal != "A" || res.Conflict.Terminal != "t" {
+		t.Fatalf("冲突格 = %+v，期望 (A, t)", res.Conflict)
+	}
+	// 同一规则在表格与冲突计数中仍只算一条
+	if !reflect.DeepEqual(res.Conflict.ProductionIDs, []int{2, 3}) {
+		t.Fatalf("竞争规则 = %v，期望 [2 3]（A -> B 只计一次）", res.Conflict.ProductionIDs)
+	}
+	if !reflect.DeepEqual(res.Table["A"]["t"], []int{2, 3}) {
+		t.Fatalf("M[A, t] = %v，期望 [2 3]（重复入格已去重）", res.Table["A"]["t"])
+	}
+
+	// A -> B：保留 FIRST 与 FOLLOW 两份来源
+	var dual *ConflictSource
+	for i := range res.Conflict.Sources {
+		if res.Conflict.Sources[i].ProductionID == 2 {
+			dual = &res.Conflict.Sources[i]
+		}
+	}
+	if dual == nil || len(dual.Sources) != 2 {
+		t.Fatalf("A -> B 应有 FIRST 与 FOLLOW 两份来源：%+v", res.Conflict.Sources)
+	}
+	wf := witnessOf(t, res, 2, "first")
+	if got := chainIDs(wf); !reflect.DeepEqual(got, []int{2, 4}) {
+		t.Errorf("FIRST 链 = %v，期望 [2 4]（A -> B 经 B -> t）", got)
+	}
+	wfl := witnessOf(t, res, 2, "follow")
+	if got := chainIDs(wfl); !reflect.DeepEqual(got, []int{2, 1}) {
+		t.Errorf("FOLLOW 链 = %v，期望 [2 1]（B 可空，经 S -> A t）", got)
+	}
+	if !strings.Contains(wfl.Chain[0].Note, "可空") {
+		t.Errorf("FOLLOW 首环应说明右部可空：%q", wfl.Chain[0].Note)
+	}
+	assertSourcesComplete(t, res)
+}
+
+// 19) 循环传播：A -> B 与 B -> A 使 FOLLOW(A)、FOLLOW(B) 互相传入，
+//     见证链必须取环外的最短路径，不能绕环循环。
+func TestWitnessCyclicFollowNoLoop(t *testing.T) {
+	text := strings.Join([]string{
+		"S -> A b",
+		"A -> B",
+		"B -> A",
+		"B -> b",
+		"A ->",
+		"A -> b",
+	}, "\n")
+	res, err := analyze(text, "S", []string{"b"})
+	if err != nil {
+		t.Fatalf("analyze: %v", err)
+	}
+	if res.Conflict == nil || res.Conflict.Nonterminal != "A" || res.Conflict.Terminal != "b" {
+		t.Fatalf("冲突格 = %+v，期望 (A, b)", res.Conflict)
+	}
+	if !reflect.DeepEqual(res.Conflict.ProductionIDs, []int{2, 5, 6}) {
+		t.Fatalf("竞争规则 = %v，期望 [2 5 6]", res.Conflict.ProductionIDs)
+	}
+
+	// A -> ε 的 FOLLOW 见证：最短路径是 S -> A b 直接命中，不绕 A -> B -> A 环
+	w := witnessOf(t, res, 5, "follow")
+	if got := chainIDs(w); !reflect.DeepEqual(got, []int{5, 1}) {
+		t.Fatalf("FOLLOW 链 = %v，期望 [5 1]（不绕环）", got)
+	}
+	seen := map[int]bool{}
+	for _, l := range w.Chain {
+		if seen[l.ProductionID] {
+			t.Fatalf("见证链出现循环：%v", chainIDs(w))
+		}
+		seen[l.ProductionID] = true
+	}
+
+	// 直接验证内部推导：FOLLOW(B) 经 A -> B 由 FOLLOW(A) 传入，同样不绕环
+	g, err := parseGrammar(text, "S")
+	if err != nil {
+		t.Fatalf("parseGrammar: %v", err)
+	}
+	g.computeSets()
+	follows := g.followChains("b", g.firstChains("b"))
+	var gotB []int
+	for _, l := range follows["B"] {
+		gotB = append(gotB, l.ProductionID)
+	}
+	if !reflect.DeepEqual(gotB, []int{2, 1}) {
+		t.Errorf("FOLLOW(B) 链 = %v，期望 [2 1]（A -> B 再 S -> A b）", gotB)
+	}
+	assertSourcesComplete(t, res)
+}
+
+// 20) 并列路径：t ∈ FOLLOW(A) 可经 M -> A t 或 B -> A t（同为一步），
+//     按产生式原始顺序裁决，取编号最小的 M -> A t。
+func TestWitnessTieBreakProductionOrder(t *testing.T) {
+	text := strings.Join([]string{
+		"S -> M",
+		"S -> B",
+		"M -> A t",
+		"B -> A t",
+		"A -> t",
+		"A ->",
+	}, "\n")
+	res, err := analyze(text, "S", []string{"t"})
+	if err != nil {
+		t.Fatalf("analyze: %v", err)
+	}
+	if res.Conflict == nil || res.Conflict.Nonterminal != "A" || res.Conflict.Terminal != "t" {
+		t.Fatalf("冲突格 = %+v，期望 (A, t)", res.Conflict)
+	}
+	w := witnessOf(t, res, 6, "follow")
+	if got := chainIDs(w); !reflect.DeepEqual(got, []int{6, 3}) {
+		t.Fatalf("并列路径应取原始顺序最小者：链 = %v，期望 [6 3]（M -> A t 而非 B -> A t）", got)
+	}
+	assertSourcesComplete(t, res)
+}
+
+// 21) 结束符列冲突：$ ∈ FOLLOW(A) 的链尾落到开始符定义（无产生式环节，ID 为 0）。
+func TestWitnessStartSymbolDollar(t *testing.T) {
+	text := strings.Join([]string{
+		"S -> A",
+		"A ->",
+		"A -> B",
+		"B ->",
+	}, "\n")
+	res, err := analyze(text, "S", nil)
+	if err != nil {
+		t.Fatalf("analyze: %v", err)
+	}
+	if res.Conflict == nil || res.Conflict.Nonterminal != "A" || res.Conflict.Terminal != "$" {
+		t.Fatalf("冲突格 = %+v，期望 (A, $)", res.Conflict)
+	}
+	w := witnessOf(t, res, 2, "follow")
+	if got := chainIDs(w); !reflect.DeepEqual(got, []int{2, 1, 0}) {
+		t.Fatalf("FOLLOW 链 = %v，期望 [2 1 0]（S -> A 后接开始符定义）", got)
+	}
+	last := w.Chain[len(w.Chain)-1]
+	if !strings.Contains(last.Note, "开始符") {
+		t.Errorf("链尾应说明开始符定义：%q", last.Note)
+	}
+	assertSourcesComplete(t, res)
+}
+
+// 22) 非法文法整次拒绝：HTTP 返回 400 与错误，不返回任何冲突、来源或表格（没有半份结果）。
+func TestInvalidGrammarRejectedWhole(t *testing.T) {
+	body := `{"grammar":"S -> A b","start":"S","tokens":["b"]}`
+	req := httptest.NewRequest(http.MethodPost, "/api/analyze", strings.NewReader(body))
+	recorder := httptest.NewRecorder()
+	handleAnalyze(recorder, req)
+	if recorder.Code != http.StatusBadRequest {
+		t.Fatalf("非法文法应返回 400，实际 %d", recorder.Code)
+	}
+	var resp map[string]any
+	if err := json.Unmarshal(recorder.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("响应不是合法 JSON：%v", err)
+	}
+	if _, ok := resp["error"]; !ok {
+		t.Fatal("非法文法应返回 error")
+	}
+	for _, key := range []string{"conflict", "sources", "table", "trace"} {
+		if _, ok := resp[key]; ok {
+			t.Errorf("非法文法不得返回半份结果（响应含字段 %q）", key)
+		}
+	}
+}
+
+// 23) HTTP 冲突响应与 Go 分析器共用同一产生式身份与来源链。
+func TestWitnessHTTPSameSources(t *testing.T) {
+	text := strings.Join([]string{
+		"S -> A t",
+		"A -> B",
+		"A -> t",
+		"B -> t",
+		"B ->",
+	}, "\n")
+	direct, err := analyze(text, "S", []string{"t"})
+	if err != nil {
+		t.Fatalf("analyze: %v", err)
+	}
+	body := `{"grammar":"` + strings.ReplaceAll(text, "\n", `\n`) + `","start":"S","tokens":["t"]}`
+	req := httptest.NewRequest(http.MethodPost, "/api/analyze", strings.NewReader(body))
+	recorder := httptest.NewRecorder()
+	handleAnalyze(recorder, req)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("HTTP %d: %s", recorder.Code, recorder.Body.String())
+	}
+	var httpRes AnalyzeResult
+	if err := json.Unmarshal(recorder.Body.Bytes(), &httpRes); err != nil {
+		t.Fatalf("响应不是合法 JSON：%v", err)
+	}
+	if !reflect.DeepEqual(httpRes.Conflict, direct.Conflict) {
+		t.Fatal("HTTP 响应的冲突与来源见证应与 Go 分析器完全一致")
+	}
+}
